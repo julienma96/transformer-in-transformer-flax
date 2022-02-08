@@ -71,7 +71,8 @@ class Embedding(nn.Module):
             output = nn.Dense(
                 features=config.inner_emb_dim,
                 kernel_init=config.kernel_init, bias_init=config.bias_init,
-                dtype=config.dtype
+                dtype=config.dtype,
+                name="inner_embeddings"
             )(inner_tokens)
         else:
             amount_outer_tokens = (config.img_shape[0] // config.outer_size) ** 2  # for one image
@@ -96,7 +97,15 @@ class PositionalEmbedding(nn.Module):
 
 
 class MultiHeadSelfAttention(nn.Module):
-    pass
+    config: Config
+    inner: bool
+
+    @nn.compact
+    def __call__(self):
+        config = self.config
+
+        if self.inner:
+            name = " patch"
 
 
 class MLP(nn.Module):
@@ -104,11 +113,25 @@ class MLP(nn.Module):
 
 
 class TNTBlock(nn.Module):
-    pass
+    config: Config
+
+    @nn.compact
+    def __call__(self, patch_emb, pixel_emb):
+        config = self.config
+
+        x = nn.LayerNorm(dtype=config.dtype)(pixel_emb)
+        x = MultiHeadSelfAttention(config=config)
 
 
 class TransformerEncoder(nn.Module):
-    pass
+    config: Config
+
+    @nn.compact
+    def __call__(self, patch_emb, pixel_emb):
+        config = self.config
+        for _ in range(config.tnt_blocks):
+            patch_emb, pixel_emb = TNTBlock(config=config)(patch_emb=patch_emb, pixel_emb=pixel_emb)
+        return patch_emb
 
 
 class TransformerInTransformer(nn.Module):
@@ -123,10 +146,11 @@ class TransformerInTransformer(nn.Module):
         outer_emb = Embedding(config=config, inner=False)(images)
         inner_emb = Embedding(config=config, inner=True)(images)
 
-        # add positional embeddings
+        # create positional embeddings
         outer_pos_emb = PositionalEmbedding(config=config, inner=False)(outer_emb)  # amount_outer_tokens + class token, outer_emb_dim
         inner_pos_emb = PositionalEmbedding(config=config, inner=True)(inner_emb)  # amount_inner_tokens, inner_emb_dim
 
+        # add positional embeddings
         outer_emb = repeat(outer_emb, "n d -> b n d", b=b) + rearrange(outer_pos_emb, "n d -> () n d")
         inner_emb = inner_emb + rearrange(inner_pos_emb, "n d -> () n d")
 
@@ -137,7 +161,6 @@ if __name__ == '__main__':
     cfg = Config()
     key1, key2 = random.split(random.PRNGKey(0))
     model = TransformerInTransformer(config=cfg)
-    sample = jnp.ones(shape=(1, ) + cfg.img_shape)
+    sample = jnp.ones(shape=(2, ) + cfg.img_shape)
     params = model.init(key1, sample)
-    out1, out2 = model.apply(params, sample)
-    print(out1.shape, out2.shape)
+    out1, out2, out3 = model.apply(params, sample)
