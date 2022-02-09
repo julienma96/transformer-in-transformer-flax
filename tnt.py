@@ -23,10 +23,12 @@ from einops import rearrange, repeat
 
 @struct.dataclass
 class Config:
-    # general options/parameters
+    # general (model) options/parameters
     dtype: Any = jnp.float32
     num_classes: int = 10  # mnist dataset has 10 classes
     tnt_blocks: int = 6  # amount of tnt blocks which will be stacked
+    attention_dropout: float = .0
+    mlp_dropout: float = .0
 
     # inits
     kernel_init: Callable = initializers.xavier_uniform()
@@ -42,12 +44,14 @@ class Config:
     outer_size: int = 15
     outer_emb_dim: int = 192  # 80
     outer_heads: int = 3  # 8
+    outer_head_dim: int = 64
     outer_expansion_rate = 4  # 3  # the MLP block will use a Dense Layer to project the feature vector to a new feature vector patch_expansion_rate times the feature vector's original size before using another Dense layer to squeeze the new feature vector to it's original size
 
     # pixel parameters (pixel=smaller patch, so not a real image pixel)
     inner_size: int = 5
     inner_emb_dim: int = 12  # 16
     inner_heads: int = 2
+    inner_head_dim: int = 64
     inner_expansion_rate = 4  # 3  # see patch_expansion_rate comment above
 
 
@@ -101,15 +105,67 @@ class MultiHeadSelfAttention(nn.Module):
     inner: bool
 
     @nn.compact
-    def __call__(self):
+    def __call__(self, embeddings):
         config = self.config
 
         if self.inner:
-            name = " patch"
+            name = "inner_"
+            features = (3, config.inner_heads, config.inner_head_dim)  # 3 because -> different parameters for q, k, v
+        else:
+            name = "outer_"
+            features = (3, config.outer_heads, config.outer_head_dim)  # 3 because -> different parameters for q, k, v
+
+        qkv = nn.DenseGeneral(features=features,
+                              axis=-1,
+                              kernel_init=config.kernel_init, use_bias=False,
+                              name=name + "qkv"
+                              )(embeddings)
+        # split them up at axis -3 (see above comments) to divide the array to q k v and remove redundant dimensions
+        qkv = jnp.split(qkv, axis=-3)  # tuple with 3 arrays, but contains redundant dimension
+        q, k, v = map(lambda x: jnp.squeeze(x), qkv)
+        attention_weights = jnp.einsum("...hqk, ...khd -> qhd", q, k) / jnp.sqrt(features[-1]).astype(config.dtype)
+        v = jnp.einsum("...hqk, ...khd -> qhd", attention_weights, v)
+
+        attention_output = nn.DenseGeneral(features=embeddings.shape[-1],
+                                           axis=(-2, -1),
+                                           kernel_init=config.kernel_init, use_bias=False,
+                                           name=name + "attention_output"
+                                           )(v)
+        if config.attention_dropout:
+            attention_output = nn.Dropout(config.attention_dropout)(attention_output)
+        return attention_output
 
 
 class MLP(nn.Module):
-    pass
+    config: Config
+    inner: bool
+
+    @nn.compact
+    def __call__(self, embeddings):
+        config = self.config
+
+        emb_dim = embeddings.shape[-1]
+        if self.inner:
+            name = "inner_"
+            expansion_rate = config.inner_expansion_rate
+        else:
+            name = "outer_"
+            expansion_rate = config.outer_expansion_rate
+
+        embeddings = nn.Dense(features=emb_dim * expansion_rate,
+                              kernel_init=config.kernel_init, bias_init=config.bias_init,
+                              dtype=config.dtype,
+                              name=name + "expansion"
+                              )(embeddings)
+        embeddings = nn.gelu(embeddings)
+        if config.mlp_dropout:
+            embeddings = nn.Dropout(config.mlp_dropout)(embeddings)
+        embeddings = nn.Dense(features=emb_dim,
+                              kernel_init=config.kernel_init, bias_init=config.bias_init,
+                              dtype=config.dtype,
+                              name=name + "squeeze"
+                              )(embeddings)
+        return embeddings
 
 
 class TNTBlock(nn.Module):
