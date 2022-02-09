@@ -124,6 +124,7 @@ class MultiHeadSelfAttention(nn.Module):
         qkv = jnp.split(qkv, axis=-3, indices_or_sections=3)  # tuple with 3 arrays, but contains redundant dimension
         q, k, v = map(lambda x: jnp.squeeze(x), qkv)
         attention_weights = jnp.einsum("...nid, ...njd -> ...nij", q, k) / jnp.sqrt(features[-1]).astype(config.dtype)
+        attention_weights = nn.softmax(attention_weights, axis=-1)
         v = jnp.einsum("...nij, ...njd -> ...nid", attention_weights, v)
 
         attention_output = nn.DenseGeneral(features=embeddings.shape[-1],
@@ -183,7 +184,7 @@ class TNTBlock(nn.Module):
 
         # inner block
         x = nn.LayerNorm(dtype=config.dtype)(inner_emb)
-        x = MultiHeadSelfAttention(config=config)(x)
+        x = MultiHeadSelfAttention(config=config, inner=True)(x)
         x = x + inner_emb
 
         inner_output = nn.LayerNorm(dtype=config.dtype)(x)
@@ -191,6 +192,8 @@ class TNTBlock(nn.Module):
         inner_output = inner_output + x
 
         # Addition: inner block + outer embeddings
+        num_patches = (config.img_shape[0] // config.outer_size) ** 2
+
         projected_inner_output = nn.LayerNorm(dtype=config.dtype)(inner_output)
         projected_inner_output = rearrange(projected_inner_output, "... n d -> ... (n d)")
         projected_inner_output = nn.Dense(features=outer_emb.shape[-1],  # ==config.outer_emb_dim
@@ -199,6 +202,19 @@ class TNTBlock(nn.Module):
                                           name="inner_to_outer_embedding_projection"
                                           )(projected_inner_output)
 
+        projected_inner_output = rearrange(projected_inner_output, "(b n) d -> b n d", n=num_patches)
+        projected_inner_output = jnp.pad(projected_inner_output, ((0, 0), (0, 1), (0, 0)))
+        outer_emb = outer_emb + projected_inner_output
+
+        # outer block
+        x = nn.LayerNorm(dtype=config.dtype)(outer_emb)
+        x = MultiHeadSelfAttention(config=config, inner=False)(x)
+        outer_emb = x + outer_emb
+
+        outer_output = nn.LayerNorm(dtype=config.dtype)(outer_emb)
+        outer_output = MLP(config=config, inner=False)(outer_output)
+        outer_output = outer_output + outer_emb
+        return outer_output, inner_output
 
 
 class TransformerEncoder(nn.Module):
@@ -208,8 +224,8 @@ class TransformerEncoder(nn.Module):
     def __call__(self, outer_emb, inner_emb):
         config = self.config
         for _ in range(config.tnt_blocks):
-            patch_emb, pixel_emb = TNTBlock(config=config)(patch_emb=outer_emb, pixel_emb=inner_emb)
-        return inner_emb
+            outer_emb, inner_emb = TNTBlock(config=config)(outer_emb=outer_emb, inner_emb=inner_emb)
+        return outer_emb
 
 
 class TransformerInTransformer(nn.Module):
@@ -232,8 +248,14 @@ class TransformerInTransformer(nn.Module):
         outer_emb = repeat(outer_emb, "n d -> b n d", b=b) + rearrange(outer_pos_emb, "n d -> () n d")
         inner_emb = inner_emb + rearrange(inner_pos_emb, "n d -> () n d")
 
-        attention = MultiHeadSelfAttention(config=config, inner=True)(inner_emb)
-        return outer_emb, inner_emb
+        outer_emb = TransformerEncoder(config=config)(outer_emb=outer_emb, inner_emb=inner_emb)
+        outer_emb = outer_emb[:, 0, ...]
+        outer_emb = nn.Dense(features=config.num_classes,
+                             kernel_init=config.kernel_init, bias_init=config.bias_init,
+                             dtype=config.dtype,
+                             name="class_token_embedding_to_classes"
+                             )(outer_emb)
+        return outer_emb
 
 
 if __name__ == '__main__':
@@ -242,5 +264,5 @@ if __name__ == '__main__':
     model = TransformerInTransformer(config=cfg)
     sample = jnp.ones(shape=(2, ) + cfg.img_shape)
     params = model.init(key1, sample)
-    attention = model.apply(params, sample)
-    print(attention.shape)
+    out = model.apply(params, sample)
+    print(out.shape)
