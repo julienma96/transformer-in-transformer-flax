@@ -1,21 +1,12 @@
 # general useful functionalities
 from typing import Any, Callable, Sequence, Optional
-from functools import partial
 
 # jax/flax imports
-import jax
-from jax import numpy as jnp, vmap, pmap, jit, grad, random, lax
+from jax import numpy as jnp
 from jax.nn import initializers
 
-import flax
-from flax.core import freeze, unfreeze
-from flax.training import train_state  # just for convenience
 from flax import linen as nn  # explains itself
-from flax import serialization
 from flax import struct
-
-# optimizer
-import optax  # offers optimizers, don't use flax.optim, flax is built very modular and in a collaborative way, flax themselves state that people should now use optax for optimizers instead of flax.optim
 
 # array manipulation
 from einops import rearrange, repeat
@@ -25,8 +16,8 @@ from einops import rearrange, repeat
 class Config:
     # general (model) options/parameters
     dtype: Any = jnp.float32
-    num_classes: int = 10  # mnist dataset has 10 classes
-    tnt_blocks: int = 6  # amount of tnt blocks which will be stacked
+    num_classes: int = 10
+    tnt_blocks: int = 6
     attention_dropout: float = .0
     mlp_dropout: float = .0
 
@@ -35,24 +26,24 @@ class Config:
     bias_init: Callable = initializers.normal(stddev=1e-6)
     pos_emb_init: Callable = initializers.normal(stddev=0.02)
     emb_init: Callable = initializers.zeros
-    learning_rate = 0.001
+    learning_rate: float = 0.001
 
     # image parameters
-    img_shape = (150, 150, 1)
+    img_shape: Sequence = (150, 150, 1)
 
     # patch parameters
     outer_size: int = 15
-    outer_emb_dim: int = 192  # 80
-    outer_heads: int = 3  # 8
+    outer_emb_dim: int = 192
+    outer_heads: int = 3
     outer_head_dim: int = 64
-    outer_expansion_rate = 4  # 3  # the MLP block will use a Dense Layer to project the feature vector to a new feature vector patch_expansion_rate times the feature vector's original size before using another Dense layer to squeeze the new feature vector to it's original size
+    outer_expansion_rate: int = 4
 
     # pixel parameters (pixel=smaller patch, so not a real image pixel)
     inner_size: int = 5
-    inner_emb_dim: int = 12  # 16
+    inner_emb_dim: int = 12
     inner_heads: int = 2
     inner_head_dim: int = 64
-    inner_expansion_rate = 4  # 3  # see patch_expansion_rate comment above
+    inner_expansion_rate = 4
 
 
 class Embedding(nn.Module):
@@ -259,10 +250,15 @@ class TransformerInTransformer(nn.Module):
 
 
 if __name__ == '__main__':
+    from jax import random, tree_map
+    from pprint import pprint
+
     cfg = Config()
     key1, key2 = random.split(random.PRNGKey(0))
     model = TransformerInTransformer(config=cfg)
     sample = jnp.ones(shape=(2, ) + cfg.img_shape)
     params = model.init(key1, sample)
     out = model.apply(params, sample)
+
+    pprint(tree_map(lambda x: x.shape, params))
     print(out.shape)
